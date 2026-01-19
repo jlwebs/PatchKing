@@ -2,7 +2,9 @@
 
 ![Patch King Screenshot](screenshot.png)
 
-**Patch King** is a powerful patch management plugin for x64dbg, designed to replicate and enhance the "Patches" window functionality from OllyDbg. It allows reversers to easily view, manage, filter, and export patches within the x64dbg environment.
+**Patch King** is a powerful patch management plugin for x64dbg, designed to replicate and enhance the "Patches" window functionality from OllyDbg.
+
+Leveraging **multi-threading and optimized loading tactics**, it supports instant loading of large patch lists (100KB+)—resolving system crashes often encountered with the default patch manager.
 
 ## Key Features
 
@@ -28,8 +30,13 @@
     *   **Remove All**: Clear the list (hide entries).
 *   **Follow in Disassembler**: Jump directly to the patch address in the CPU view.
 
-### 5. Import / Export
-*   **Save/Load**: Export your patches to a file and reload them later, perfect for sharing or saving progress.
+### 5. Smart Navigation & Statistics
+*   **Auto Next**: Significantly speeds up manual review. Automatically selects the next patch in the list after you "Follow" an item or double-click.
+*   **Follow Above**: Context-first view. Jumps to ~3 instructions *preceding* the patch address, giving you immediate visibility into the logic flow leading to the patch.
+*   **Live Stats**: Status bar displays real-time counts of "Old" (Original) vs "New" (Patched) items (active scan for lists < 2000 items).
+
+### 6. Import / Export
+*   **Save/Load**: Export your patches to a file and reload them later.
 *   **Format**: Supports parsing standard patch formats.
 
 ## Shortcuts

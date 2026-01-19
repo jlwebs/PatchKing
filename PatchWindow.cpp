@@ -9,6 +9,7 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 #include <windows.h>
 #pragma comment(lib, "comctl32.lib")
@@ -29,6 +30,7 @@
 #define ID_MENU_SAVE 2009
 #define ID_MENU_REMOVE_ALL_IN_LIST 2010
 #define ID_MENU_TOGGLE_BPS_ALL 2011
+#define ID_MENU_EXPORT_CSV 2012
 
 std::vector<PatchInfo> g_Patches;    // THE DISPLAYED LIST (Filtered)
 std::vector<PatchInfo> g_AllPatches; // THE FULL LIST (Source of truth)
@@ -42,9 +44,32 @@ HWND hChkInverseOld = NULL;
 HWND hChkInverseNew = NULL;
 #define ID_CHK_INVERSE_OLD 1005
 #define ID_CHK_INVERSE_NEW 1006
+#define ID_CHK_REGEX 1007
+#define ID_CHK_FOLLOW_MOVE 1008
+#define ID_STATIC_STATUS 1009
+#define ID_CHK_FOLLOW_ABOVE 1010
+#define ID_EDIT_FOLLOW_LINES 1011
+#define ID_STATIC_FOLLOW_LABEL 1012
+#define ID_CHK_PRO_ANALYZE 1013
+#define ID_CHK_FLATTEN_LINE 1014
 
 WNDPROC oldListWndProc = NULL;
 HFONT g_hBoldFont = NULL;
+
+HWND hChkRegex = NULL;
+HWND hChkFollowMove = NULL;
+HWND hChkFollowAbove = NULL;
+HWND hEditFollowLines = NULL;
+HWND hStaticFollowLabel = NULL;
+HWND hChkProAnalyze = NULL;
+HWND hChkFlattenLine = NULL;
+HWND hStaticStatus = NULL;
+
+// Persistent Settings
+// Global State
+bool g_bProAnalyze = true;
+bool g_bFlattenLine = false; // New Flatten Option
+static int g_nFollowLines = 3;
 
 // Forward Declarations
 void RefreshPatchList();
@@ -52,6 +77,7 @@ void ApplyFilter();
 bool ApplyPatch(const PatchInfo &patch);
 bool RestorePatch(const PatchInfo &patch);
 void ShowContextMenu(HWND hwnd, POINT pt);
+void UpdateStatus();
 
 // Helper: Check if memory matches bytes
 bool IsMemoryMatching(duint addr, const std::vector<unsigned char> &bytes) {
@@ -107,11 +133,69 @@ std::string Utf8ToAnsi(const std::string &utf8) {
 }
 
 // Finalized Solution: Official SDK Demands (OSD)
+// Finalized Solution: Official SDK Demands (OSD)
 duint FindCorrectOldHead(duint patchAddr,
-                         const std::vector<unsigned char> &oldBytes) {
+                         const std::vector<unsigned char> &oldBytes,
+                         bool useProAnalyze, int lines) {
   const DBGFUNCTIONS *funcs = DbgFunctions();
   if (!funcs)
     return patchAddr;
+
+  if (useProAnalyze) {
+    // --- ProAnalyze Logic: Sync Back & Scan Forward ---
+    duint target = patchAddr;
+    char buf[256];
+
+    // 1. Establish Sync Point (Backtrack)
+    if (lines >= 4) {
+      duint base = patchAddr - 0xE;
+      sprintf(buf, "dis.prev(0x%llX)", (unsigned long long)base);
+      target = DbgValFromString(buf);
+      int backSteps = lines - 4;
+      for (int k = 0; k < backSteps; k++) {
+        sprintf(buf, "dis.prev(0x%llX)", (unsigned long long)target);
+        target = DbgValFromString(buf);
+      }
+    } else {
+      for (int i = 0; i < lines; i++) {
+        sprintf(buf, "dis.prev(0x%llX)", (unsigned long long)target);
+        target = DbgValFromString(buf);
+      }
+    }
+
+    // Log("[PatchMgr][ProAnalyze] Target 0x%llX Backtracked to SyncPoint
+    // 0x%llX\n", (unsigned long long)patchAddr, (unsigned long long)target);
+
+    // 2. Scan Forward to find True Head
+    duint scanCur = target;
+    for (int i = 0; i < 50; i++) { // Max 50 checks
+      BASIC_INSTRUCTION_INFO instr;
+      unsigned char data[16];
+      memset(&instr, 0, sizeof(instr));
+      if (DbgMemRead(scanCur, data, 16) &&
+          DbgFunctions()->DisasmFast(data, scanCur, &instr)) {
+        duint next = scanCur + instr.size;
+        // Check if patchAddr is INSIDE this instruction
+        if (scanCur <= patchAddr && patchAddr < next) {
+          if (scanCur != patchAddr) {
+            // Log("[PatchMgr][ProAnalyze] FIXED: Patch 0x%llX -> TrueHead
+            // 0x%llX\n", (unsigned long long)patchAddr, (unsigned long
+            // long)scanCur);
+          }
+          return scanCur; // Found the true head
+        }
+        scanCur = next;
+        if (scanCur > patchAddr) {
+          // Log("[PatchMgr][ProAnalyze] Failed: Overshot 0x%llX at 0x%llX\n",
+          // (unsigned long long)patchAddr, (unsigned long long)scanCur);
+          break; // Overshot
+        }
+      } else {
+        scanCur++;
+      }
+    }
+    // Fallback to old logic if ProAnalyze fails (unlikely)
+  }
 
   // Strategy 1: Source Info
   char sourceFile[MAX_PATH] = {0};
@@ -162,6 +246,235 @@ duint FindCorrectOldHead(duint patchAddr,
   return patchAddr;
 }
 
+// Helper to get formatted disassembly for the "NEW" state
+// We use GuiGetDisassembly to match the rich text in the CPU view.
+static void GetRichDisassembly(duint addr, std::string &outDisasm) {
+  char text[GUI_MAX_DISASSEMBLY_SIZE] = "";
+  if (GuiGetDisassembly(addr, text)) {
+    outDisasm = text;
+  } else {
+    // Fallback if GUI function fails
+    DISASM_INSTR dInstr;
+    DbgDisasmAt(addr, &dInstr);
+    outDisasm = dInstr.instruction;
+  }
+}
+
+// Helper to resolve symbols in the "Old" raw disassembly string.
+// DisasmFast returns raw hex (e.g. "call 0x401000" or "mov eax, [0x402000]").
+// We parse these hex strings and try to resolve them to labels to match "Rich"
+// display.
+static void EnhanceOldDisassembly(std::string &text) {
+  // 1. Look for brackets [0xADDR] or [ADDR]
+  size_t startBracket = 0;
+  while ((startBracket = text.find('[', startBracket)) != std::string::npos) {
+    size_t endBracket = text.find(']', startBracket);
+    if (endBracket == std::string::npos)
+      break;
+
+    // Extract content
+    std::string content =
+        text.substr(startBracket + 1, endBracket - startBracket - 1);
+
+    // Check if content is hex address
+    // DisasmFast often uses 0x prefix, or just hex
+    duint addr = 0;
+    bool isHex = false;
+    try {
+      size_t idx = 0;
+      if (content.rfind("0x", 0) == 0) // Starts with 0x?
+        addr = (duint)std::stoull(content.substr(2), &idx, 16);
+      else
+        addr = (duint)std::stoull(content, &idx, 16);
+
+      if (idx > 0)
+        isHex = true;
+    } catch (...) {
+    }
+
+    if (isHex && addr > 0x1000) { // Filter small numbers
+      char label[MAX_COMMENT_SIZE] = {0};
+      if (DbgGetLabelAt(addr, SEG_DEFAULT, label)) {
+        // Replace [0x40...] with [<&Label>]
+        std::string replacement = "[<";
+        if (label[0] == '&')
+          replacement = "["; // Label already has &? usually not.
+        // x64dbg convention: <symbol>
+        replacement += label;
+        replacement += ">]";
+
+        text.replace(startBracket, endBracket - startBracket + 1, replacement);
+        startBracket += replacement.length();
+        continue;
+      }
+    }
+    startBracket = endBracket + 1;
+  }
+
+  // 2. Look for immediate calls/jumps "call 0xADDR"
+  // Heuristic: "call " or "jmp " followed by hex
+  const char *prefixes[] = {"call ", "jmp ", "ja ", "je ", "jnz ", "jz "};
+  for (const char *prefix : prefixes) {
+    size_t pos = 0;
+    while ((pos = text.find(prefix, pos)) != std::string::npos) {
+      size_t addrStart = pos + strlen(prefix);
+      // Skip 0x if present
+      if (addrStart + 2 < text.length() && text.substr(addrStart, 2) == "0x") {
+        addrStart += 2;
+      }
+
+      // Pars hex
+      size_t addrEnd = addrStart;
+      while (addrEnd < text.length() && isxdigit(text[addrEnd])) {
+        addrEnd++;
+      }
+
+      if (addrEnd > addrStart) {
+        std::string hexStr = text.substr(addrStart, addrEnd - addrStart);
+        duint addr = 0;
+        try {
+          addr = (duint)std::stoull(hexStr, nullptr, 16);
+        } catch (...) {
+        }
+
+        if (addr > 0x1000) {
+          char label[MAX_COMMENT_SIZE] = {0};
+          if (DbgGetLabelAt(addr, SEG_DEFAULT, label)) {
+            // Replace ADDR with <Label>
+            std::string replacement = "<";
+            replacement += label;
+            replacement += ">";
+
+            // We might need to replace the whole 0xADDR part
+            // Check if we skipped 0x
+            size_t replaceStart = pos + strlen(prefix);
+            text.replace(replaceStart, addrEnd - replaceStart, replacement);
+            pos = replaceStart + replacement.length();
+            continue;
+          }
+        }
+      }
+      pos = addrEnd;
+    }
+  }
+}
+
+// Helper function to resolve details (disassembly, comments) for a patch group.
+// Designed to be run in parallel.
+// Helper function to resolve details (disassembly, comments) for a patch group.
+// Designed to be run in parallel.
+static void ResolvePatchDetails(PatchInfo &p, bool fastMode, bool useProAnalyze,
+                                int lines) {
+  const DBGFUNCTIONS *funcs = DbgFunctions();
+  p.head = FindCorrectOldHead(p.address, p.oldBytes, useProAnalyze, lines);
+  BASIC_INSTRUCTION_INFO bInfo;
+  DISASM_INSTR dInstr;
+
+  // Disassemble NEW
+  if (fastMode) {
+    DbgDisasmAt(p.head, &dInstr);
+    p.disasm = dInstr.instruction;
+  } else {
+    GetRichDisassembly(p.head, p.disasm);
+    // We still need dInstr for operand info later
+    DbgDisasmAt(p.head, &dInstr);
+  }
+
+  // Disassemble OLD
+  unsigned char bytes[128] = {0};
+  DbgMemRead(p.head, bytes, 120);
+  for (size_t k = 0; k < p.oldBytes.size(); ++k) {
+    size_t off = (size_t)(p.address + k - p.head);
+    if (off < 120)
+      bytes[off] = p.oldBytes[k];
+  }
+  if (funcs && funcs->DisasmFast) {
+    funcs->DisasmFast(bytes, p.head, &bInfo);
+    p.oldDisasm = bInfo.instruction;
+    if (!fastMode) {
+      EnhanceOldDisassembly(p.oldDisasm);
+    }
+  }
+
+  // Skip expensive comment/label lookups in fast mode
+  if (fastMode) {
+    return;
+  }
+
+  char comment[MAX_COMMENT_SIZE] = "";
+  bool found = false;
+
+  // 1. Try Comment at HEAD (User or Auto if supported)
+  // Use DbgGetCommentAt checking for both user and potentially auto comments
+  if (DbgGetCommentAt(p.head, comment)) {
+    // If it starts with \1, it's auto. x64dbg conventions.
+    found = true;
+  }
+
+  // 2. Try Label at HEAD
+  if (!found) {
+    if (DbgGetLabelAt(p.head, SEG_DEFAULT, comment)) {
+      found = true;
+    }
+  }
+
+  // 3. Address Reference / Operand Analysis
+  if (!found) {
+    for (int k = 0; k < dInstr.argcount; ++k) {
+      duint targetAddr = dInstr.arg[k].value;
+      // Ignore small values (likely not pointers)
+      if (targetAddr < 0x1000)
+        continue;
+
+      char info[MAX_COMMENT_SIZE] = "";
+
+      // 3a. Try Label at Target
+      if (DbgGetLabelAt(targetAddr, SEG_DEFAULT, info)) {
+        snprintf(comment, MAX_COMMENT_SIZE, "0x%X: \"%s\"",
+                 (unsigned int)targetAddr, info);
+        found = true;
+        break;
+      }
+
+      // 3b. Try String at Target
+      char mne[64];
+      strncpy(mne, dInstr.instruction, 63);
+      bool isBranch = false;
+      if (dInstr.instruction[0] == 'j' || dInstr.instruction[0] == 'J')
+        isBranch = true;
+      if (_strnicmp(dInstr.instruction, "call", 4) == 0)
+        isBranch = true;
+      if (_strnicmp(dInstr.instruction, "loop", 4) == 0)
+        isBranch = true;
+
+      if (!isBranch && DbgGetStringAt(targetAddr, info)) {
+        if (strlen(info) > 60)
+          strcpy(info + 57, "...");
+        snprintf(comment, MAX_COMMENT_SIZE, "0x%X: \"%s\"",
+                 (unsigned int)targetAddr, info);
+        found = true;
+        break;
+      }
+    }
+  }
+
+  // 4. Fallback: Check Patch Address itself
+  if (!found && p.address != p.head) {
+    if (DbgGetCommentAt(p.address, comment))
+      found = true;
+    else if (DbgGetLabelAt(p.address, SEG_DEFAULT, comment))
+      found = true;
+  }
+
+  if (found) {
+    char *finalComment = comment;
+    if (finalComment[0] == '\1') {
+      finalComment++;
+    }
+    p.comment = Utf8ToAnsi(finalComment);
+  }
+}
+
 // Sync from debugger to g_AllPatches
 void SyncPatchesFromDebugger() {
   const DBGFUNCTIONS *funcs = DbgFunctions();
@@ -191,128 +504,18 @@ void SyncPatchesFromDebugger() {
   if (dbgPatches.empty())
     return;
 
-  // Group
+  // Phase 1: Grouping (Linear Scan)
+  DWORD tStartGroup = GetTickCount();
+  // We just collect the raw bytes and addresses here. Expensive lookups are
+  // delayed. Reserve mainly to avoid reallocations
+  g_AllPatches.reserve(dbgPatches.size());
+
   PatchInfo current;
   current.address = dbgPatches[0].addr;
   current.moduleName = dbgPatches[0].mod;
   current.oldBytes.push_back(dbgPatches[0].oldbyte);
   current.newBytes.push_back(dbgPatches[0].newbyte);
   current.active = true;
-
-  auto finalizeGroup = [&](PatchInfo &p) {
-    p.head = FindCorrectOldHead(p.address, p.oldBytes);
-    BASIC_INSTRUCTION_INFO bInfo;
-    DISASM_INSTR dInstr;
-
-    // Disassemble NEW
-    DbgDisasmAt(p.head, &dInstr);
-    p.disasm = dInstr.instruction;
-
-    // Disassemble OLD
-    unsigned char bytes[128] = {0};
-    DbgMemRead(p.head, bytes, 120);
-    for (size_t k = 0; k < p.oldBytes.size(); ++k) {
-      size_t off = (size_t)(p.address + k - p.head);
-      if (off < 120)
-        bytes[off] = p.oldBytes[k];
-    }
-    if (funcs && funcs->DisasmFast) {
-      funcs->DisasmFast(bytes, p.head, &bInfo);
-      p.oldDisasm = bInfo.instruction;
-    }
-    char comment[MAX_COMMENT_SIZE] = "";
-    bool found = false;
-
-    // 1. Try Comment at HEAD (User or Auto if supported)
-    // Use DbgGetCommentAt checking for both user and potentially auto comments
-    if (DbgGetCommentAt(p.head, comment)) {
-      // If it starts with \1, it's auto. x64dbg conventions.
-      // We accept it either way.
-      found = true;
-    }
-
-    // 2. Try Label at HEAD
-    if (!found) {
-      if (DbgGetLabelAt(p.head, SEG_DEFAULT, comment)) {
-        found = true;
-      }
-    }
-
-    // 3. Address Reference / Operand Analysis
-    if (!found) {
-      for (int k = 0; k < dInstr.argcount; ++k) {
-        duint targetAddr = dInstr.arg[k].value;
-        // Ignore small values (likely not pointers)
-        if (targetAddr < 0x1000)
-          continue;
-
-        char info[MAX_COMMENT_SIZE] = "";
-
-        // 3a. Try Label at Target
-        if (DbgGetLabelAt(targetAddr, SEG_DEFAULT, info)) {
-          snprintf(comment, MAX_COMMENT_SIZE, "0x%X: \"%s\"",
-                   (unsigned int)targetAddr, info);
-          found = true;
-          break;
-        }
-
-        // 3b. Try String at Target
-        // CRITICAL FIX: Do NOT try to read strings for Jump/Call targets (Code
-        // addresses). Only try string resolution if mnemonic suggests data
-        // access (push, mov, lea, etc.) Simple filter: If mnemonic starts with
-        // 'j', 'c' (call), 'l' (loop), skip string check. Better: Explicitly
-        // check for 'j', 'call', 'loop'.
-        char mne[64];
-        strncpy(mne, dInstr.instruction, 63); // "push eax" or "ja 0x..."?
-        // Wait, dInstr.instruction is part of disassembly text?
-        // No, definitions say: char mnemonic[64]; in DISASM_ARG?
-        // Check DISASM_INSTR again.
-        // In bridgemain.h:
-        // typedef struct { ... char instruction[64]; DISASM_ARGTYPE type; ... }
-        // DISASM_INSTR; Actually usually the structure has a 'mnemonic' field
-        // separate or part of instruction text. But we can parse
-        // dInstr.instruction (e.g. "push 0x401000") or just rely on manual
-        // check.
-
-        // NOTE: dInstr.instruction contains the full string "mnem op1, op2".
-        // We need to check the first word.
-        bool isBranch = false;
-        if (dInstr.instruction[0] == 'j' || dInstr.instruction[0] == 'J')
-          isBranch = true;
-        if (_strnicmp(dInstr.instruction, "call", 4) == 0)
-          isBranch = true;
-        if (_strnicmp(dInstr.instruction, "loop", 4) == 0)
-          isBranch = true;
-
-        // If it is a branch, it points to code. Do NOT treat as string.
-        if (!isBranch && DbgGetStringAt(targetAddr, info)) {
-          // Truncate
-          if (strlen(info) > 60)
-            strcpy(info + 57, "...");
-          snprintf(comment, MAX_COMMENT_SIZE, "0x%X: \"%s\"",
-                   (unsigned int)targetAddr, info);
-          found = true;
-          break;
-        }
-      }
-    }
-
-    // 4. Fallback: Check Patch Address itself
-    if (!found && p.address != p.head) {
-      if (DbgGetCommentAt(p.address, comment))
-        found = true;
-      else if (DbgGetLabelAt(p.address, SEG_DEFAULT, comment))
-        found = true;
-    }
-
-    if (found) {
-      char *finalComment = comment;
-      if (finalComment[0] == '\1') {
-        finalComment++;
-      }
-      p.comment = Utf8ToAnsi(finalComment);
-    }
-  };
 
   for (size_t i = 1; i < dbgPatches.size(); ++i) {
     const auto &dp = dbgPatches[i];
@@ -321,7 +524,6 @@ void SyncPatchesFromDebugger() {
       current.oldBytes.push_back(dp.oldbyte);
       current.newBytes.push_back(dp.newbyte);
     } else {
-      finalizeGroup(current);
       g_AllPatches.push_back(current);
 
       current.address = dp.addr;
@@ -332,17 +534,181 @@ void SyncPatchesFromDebugger() {
       current.newBytes.push_back(dp.newbyte);
       current.oldDisasm.clear();
       current.disasm.clear();
-      current.comment.clear();
+      current.comment.clear(); // Ensure clear
+      current.active = true;
+    }
+  }
+  // Push last one
+  g_AllPatches.push_back(current);
+
+  DWORD tEndGroup = GetTickCount();
+  Log("[PatchMgr] Grouping %d raw patches into %d items took %d ms\n",
+      dbgPatches.size(), g_AllPatches.size(), tEndGroup - tStartGroup);
+
+  // Phase 1.5: Flattening (Optional)
+  if (g_bFlattenLine) {
+    DWORD tFlatStart = GetTickCount();
+    std::vector<PatchInfo> expanded;
+    expanded.reserve(g_AllPatches.size() * 2);
+
+    for (const auto &p : g_AllPatches) {
+      size_t totalBytes = p.oldBytes.size();
+      // Safety: Should match newBytes size
+      if (p.newBytes.size() != totalBytes) {
+        expanded.push_back(p);
+        continue;
+      }
+
+      size_t processed = 0;
+      duint currentAddr = p.address;
+
+      while (processed < totalBytes) {
+        PatchInfo chunk = p;
+        chunk.address = currentAddr;
+        chunk.oldBytes.clear();
+        chunk.newBytes.clear();
+        chunk.oldDisasm.clear();
+        chunk.disasm.clear();
+        chunk.comment.clear(); // Clear comments for sub-lines
+
+        // 1. Determine instruction length from NEW bytes (patched state)
+        // We simulate the instruction stream as per user request
+        unsigned char tempBuf[16] = {0};
+        size_t remaining = totalBytes - processed;
+        size_t copyLen = (remaining > 16) ? 16 : remaining;
+
+        for (size_t k = 0; k < copyLen; k++) {
+          tempBuf[k] = p.newBytes[processed + k];
+        }
+
+        BASIC_INSTRUCTION_INFO bInfo;
+        memset(&bInfo, 0, sizeof(bInfo));
+        // Use DisasmFast on buffer. Addr is for relative calc.
+        if (funcs && funcs->DisasmFast) {
+          funcs->DisasmFast(tempBuf, currentAddr, &bInfo);
+        } else {
+          bInfo.size = 1; // Fallback
+        }
+
+        int instrLen = bInfo.size;
+        if (instrLen <= 0 || instrLen > 15)
+          instrLen = 1;
+
+        // Users logic: "Classic tail byte + 1" implies linear sweep
+        // If patch is 5 bytes NOP, matches 1 byte NOP.
+        // If patch is 5 bytes Long Instr, matches 5 bytes.
+
+        size_t take =
+            (remaining < (size_t)instrLen) ? remaining : (size_t)instrLen;
+
+        for (size_t k = 0; k < take; k++) {
+          chunk.oldBytes.push_back(p.oldBytes[processed + k]);
+          chunk.newBytes.push_back(p.newBytes[processed + k]);
+        }
+
+        expanded.push_back(chunk);
+        currentAddr += take;
+        processed += take;
+      }
+    }
+    g_AllPatches = std::move(expanded);
+    Log("[PatchMgr] Flattened to %d items in %d ms\n", g_AllPatches.size(),
+        GetTickCount() - tFlatStart);
+  }
+
+  // Phase 2: Parallel Processing
+  // Process disassembly and comments in parallel threads.
+  unsigned int nThreads = std::thread::hardware_concurrency();
+  if (nThreads == 0)
+    nThreads = 2;
+  // Cap at 8 to prevent potential API contention overload (experimental)
+  if (nThreads > 8)
+    nThreads = 8;
+
+  // If patch count is small, force single thread to avoid overhead
+  if (g_AllPatches.size() < 100)
+    nThreads = 1;
+
+  bool fastMode = g_AllPatches.size() > 100000;
+  if (fastMode) {
+    Log("[PatchMgr] Large patch set detected (%d). Enabling Fast Mode "
+        "(skipping rich symbols/comments).\n",
+        g_AllPatches.size());
+  }
+
+  Log("[PatchMgr] Starting parallel resolution with %d threads...\n", nThreads);
+  DWORD tStartParallel = GetTickCount();
+
+  std::vector<std::thread> workers;
+  size_t total = g_AllPatches.size();
+  size_t chunk_size = (total + nThreads - 1) / nThreads;
+
+  // Read UI state from GLOBALS (Persistent & Thread Safe)
+  bool useProAnalyze = g_bProAnalyze;
+  int followLines = g_nFollowLines;
+
+  // FORCE MAIN THREAD EXECUTION FOR PRO ANALYZE
+  // x64dbg SDK 'DbgValFromString' (dis.prev) is NOT thread-safe for background
+  // threads. We must run linear on the main thread to ensure "ProAnalyze"
+  // works.
+  if (useProAnalyze) {
+    Log("[PatchMgr][ProAnalyze] >>> Starting Synchronous Scan on %d items "
+        "(Lines: %d) <<<\n",
+        total, followLines);
+    DWORD tProStart = GetTickCount();
+
+    for (size_t i = 0; i < total; ++i) {
+      ResolvePatchDetails(g_AllPatches[i], fastMode, true, followLines);
+    }
+
+    Log("[PatchMgr][ProAnalyze] <<< Finished Scan in %d ms >>>\n",
+        GetTickCount() - tProStart);
+  } else {
+    Log("[PatchMgr] Starting Parallel Scan (ProAnalyze OFF)...\n");
+    for (unsigned int t = 0; t < nThreads; ++t) {
+      workers.emplace_back(
+          [t, chunk_size, total, fastMode, useProAnalyze, followLines]() {
+            DWORD tThreadStart = GetTickCount();
+            size_t start = t * chunk_size;
+            size_t end = (std::min)(start + chunk_size, total);
+            int count = 0;
+
+            for (size_t i = start; i < end; ++i) {
+              ResolvePatchDetails(g_AllPatches[i], fastMode, useProAnalyze,
+                                  followLines);
+              count++;
+            }
+            Log("[PatchMgr] Thread %d finished: %d items in %d ms (Avg: %.2f "
+                "ms/item)\n",
+                t, count, GetTickCount() - tThreadStart,
+                count > 0 ? (float)(GetTickCount() - tThreadStart) / count : 0);
+          });
+    }
+
+    for (auto &w : workers) {
+      if (w.joinable())
+        w.join();
     }
   }
 
-  if (!dbgPatches.empty()) {
-    finalizeGroup(current);
-    g_AllPatches.push_back(current);
-  }
+  DWORD tEndParallel = GetTickCount();
+  Log("[PatchMgr] Parallel resolution took total %d ms\n",
+      tEndParallel - tStartParallel);
 
   // After sync, apply current filter to update g_Patches
   ApplyFilter();
+}
+
+// Helper for case-insensitive search
+static bool StringContains(const std::string &haystack,
+                           const std::string &needle) {
+  if (needle.empty())
+    return true;
+  auto it = std::search(haystack.begin(), haystack.end(), needle.begin(),
+                        needle.end(), [](char ch1, char ch2) {
+                          return std::toupper(ch1) == std::toupper(ch2);
+                        });
+  return (it != haystack.end());
 }
 
 void ApplyFilter() {
@@ -358,40 +724,115 @@ void ApplyFilter() {
                  SendMessage(hChkInverseOld, BM_GETCHECK, 0, 0) == BST_CHECKED);
   bool invNew = (hChkInverseNew &&
                  SendMessage(hChkInverseNew, BM_GETCHECK, 0, 0) == BST_CHECKED);
+  bool useRegex =
+      (hChkRegex && SendMessage(hChkRegex, BM_GETCHECK, 0, 0) == BST_CHECKED);
 
   std::string fOld = filterBufOld;
   std::string fNew = filterBufNew;
 
+  // Optimization: If no filter, just copy
   if (fOld.empty() && fNew.empty()) {
     g_Patches = g_AllPatches;
-  } else {
-    try {
-      std::regex reOld(fOld.empty() ? ".*" : fOld, std::regex::icase);
-      std::regex reNew(fNew.empty() ? ".*" : fNew, std::regex::icase);
+    return;
+  }
 
-      g_Patches.clear();
-      for (const auto &p : g_AllPatches) {
-        bool matchOld = std::regex_search(p.oldDisasm, reOld) ||
-                        std::regex_search(p.comment, reOld);
-        bool matchNew = std::regex_search(p.disasm, reNew);
+  // Use multi-threading for filtering if we have many items
+  unsigned int nThreads = std::thread::hardware_concurrency();
+  if (nThreads == 0)
+    nThreads = 2;
+  if (g_AllPatches.size() < 1000)
+    nThreads = 1; // Small threshold
 
-        bool passOld = true;
-        if (!fOld.empty()) {
-          passOld = invOld ? !matchOld : matchOld;
+  std::vector<std::vector<PatchInfo>> threadResults(nThreads);
+  std::vector<std::thread> workers;
+
+  size_t total = g_AllPatches.size();
+  size_t chunk_size = (total + nThreads - 1) / nThreads;
+
+  // Capture variables needed
+  for (unsigned int t = 0; t < nThreads; ++t) {
+    workers.emplace_back([t, chunk_size, total, &threadResults, fOld, fNew,
+                          invOld, invNew, useRegex]() {
+      size_t start = t * chunk_size;
+      size_t end = (std::min)(start + chunk_size, total);
+
+      try {
+        // Pre-compile regex if needed
+        std::regex reOld;
+        std::regex reNew;
+        if (useRegex) {
+          if (!fOld.empty())
+            reOld.assign(fOld, std::regex::icase);
+          if (!fNew.empty())
+            reNew.assign(fNew, std::regex::icase);
         }
 
-        bool passNew = true;
-        if (!fNew.empty()) {
-          passNew = invNew ? !matchNew : matchNew;
-        }
+        threadResults[t].reserve((end - start) / 2); // heuristic reserve
 
-        if (passOld && passNew) {
-          g_Patches.push_back(p);
+        for (size_t i = start; i < end; ++i) {
+          const auto &p = g_AllPatches[i];
+          bool matchOld = false;
+          bool matchNew = false;
+
+          if (useRegex) {
+            if (fOld.empty())
+              matchOld = true; // Handle empty regex case logic carefully
+            else
+              matchOld = std::regex_search(p.oldDisasm, reOld) ||
+                         std::regex_search(p.comment, reOld);
+
+            if (fNew.empty())
+              matchNew = true;
+            else
+              matchNew = std::regex_search(p.disasm, reNew);
+          } else {
+            // Fast String Search
+            if (fOld.empty())
+              matchOld = true;
+            else
+              matchOld = StringContains(p.oldDisasm, fOld) ||
+                         StringContains(p.comment, fOld);
+
+            if (fNew.empty())
+              matchNew = true;
+            else
+              matchNew = StringContains(p.disasm, fNew);
+          }
+
+          bool passOld = true;
+          if (!fOld.empty()) {
+            passOld = invOld ? !matchOld : matchOld;
+          }
+
+          bool passNew = true;
+          if (!fNew.empty()) {
+            passNew = invNew ? !matchNew : matchNew;
+          }
+
+          if (passOld && passNew) {
+            threadResults[t].push_back(p);
+          }
         }
+      } catch (...) {
+        // Regex error or other
       }
-    } catch (...) {
-      g_Patches = g_AllPatches;
-    }
+    });
+  }
+
+  for (auto &w : workers) {
+    if (w.joinable())
+      w.join();
+  }
+
+  // Merge results
+  g_Patches.clear();
+  size_t totalFiltered = 0;
+  for (const auto &res : threadResults)
+    totalFiltered += res.size();
+  g_Patches.reserve(totalFiltered);
+
+  for (const auto &res : threadResults) {
+    g_Patches.insert(g_Patches.end(), res.begin(), res.end());
   }
 }
 
@@ -400,45 +841,69 @@ void ApplyFilter() {
 void UpdateListView() {
   if (!hList)
     return;
-  // Restore selection and scrolling? For now simple redraw
-  int topIndex = ListView_GetTopIndex(hList);
-  int selected = ListView_GetNextItem(hList, -1, LVNI_SELECTED);
 
-  ListView_DeleteAllItems(hList);
+  // Virtual List View: Set Item Count
+  ListView_SetItemCountEx(hList, g_Patches.size(),
+                          LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
+  InvalidateRect(hList, NULL, TRUE);
+  UpdateStatus();
+}
 
-  LVITEM lvItem;
-  lvItem.mask = LVIF_TEXT | LVIF_PARAM;
+void UpdateStatus() {
+  if (!hStaticStatus)
+    return;
 
-  for (int i = 0; i < (int)g_Patches.size(); ++i) {
-    const auto &patch = g_Patches[i];
-
-    std::stringstream ssAddr;
-    ssAddr << std::hex << std::uppercase << patch.address;
-    std::string addrStr = ssAddr.str();
-
-    lvItem.iItem = i;
-    lvItem.iSubItem = 0;
-    lvItem.pszText = (LPSTR)addrStr.c_str();
-    lvItem.lParam = (LPARAM)i; // Store index into g_Patches
-    ListView_InsertItem(hList, &lvItem);
-
-    std::string oldBytesStr = BytesToHex(patch.oldBytes);
-    ListView_SetItemText(hList, i, 1, (LPSTR)oldBytesStr.c_str());
-
-    std::string newBytesStr = BytesToHex(patch.newBytes);
-    ListView_SetItemText(hList, i, 2, (LPSTR)newBytesStr.c_str());
-
-    ListView_SetItemText(hList, i, 3, (LPSTR)patch.oldDisasm.c_str());
-    ListView_SetItemText(hList, i, 4, (LPSTR)patch.disasm.c_str());
-    ListView_SetItemText(hList, i, 5, (LPSTR)patch.comment.c_str());
+  size_t total = g_Patches.size();
+  if (total == 0) {
+    SetWindowText(hStaticStatus, "Items: 0");
+    return;
   }
 
-  // Restore selection if possible (by index)
-  if (selected != -1 && selected < (int)g_Patches.size()) {
-    ListView_SetItemState(hList, selected, LVIS_SELECTED | LVIS_FOCUSED,
-                          LVIS_SELECTED | LVIS_FOCUSED);
-    ListView_EnsureVisible(hList, selected, FALSE);
+  // Optimization: If too many patches, skip expensive memory scan
+  if (total > 5000) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Items: %d (Scan Skipped > 5000)", (int)total);
+    SetWindowText(hStaticStatus, buf);
+    return;
   }
+
+  // Run in background thread to avoid UI lag even for 5000 items
+  std::thread([total]() {
+    int countOld = 0;
+    int countNew = 0;
+    // Use a local copy or be careful with concurrency.
+    // g_Patches might change?
+    // Unsafe to access g_Patches in thread if it changes.
+    // But for status update usually we are idle.
+    // Better to just run on UI thread if < 2000, or simple detached check.
+
+    // Let's run on main thread but with limit 2000.
+    // 2000 memory reads takes ~20-50ms. Acceptable.
+  }).detach();
+
+  // Re-implementation: Synchronous for safety but capped count
+  int countOld = 0;
+  int countNew = 0;
+
+  // Check up to 2000 items strictly to avoid lag
+  size_t limit = (total < 2000) ? total : 2000;
+
+  for (size_t i = 0; i < limit; ++i) {
+    if (IsMemoryMatching(g_Patches[i].address, g_Patches[i].oldBytes))
+      countOld++;
+    else if (IsMemoryMatching(g_Patches[i].address, g_Patches[i].newBytes))
+      countNew++;
+  }
+
+  char buf[128];
+  if (limit < total)
+    snprintf(buf, sizeof(buf), "Items: %d (Old: %d, New: %d) [Partial Scan]",
+             (int)total, countOld, countNew);
+  else
+    snprintf(buf, sizeof(buf), "Items: %d (Old: %d, New: %d)", (int)total,
+             countOld, countNew);
+
+  SetWindowText(hStaticStatus, buf);
 }
 
 void RefreshPatchList() {
@@ -460,6 +925,7 @@ extern "C" __declspec(dllimport) void GuiRepaintTableView();
 
 bool ImportAndApplyPatches(const char *filepath);
 bool ExportPatches(const char *filepath);
+bool ExportTableToCSV(const char *filepath);
 bool GetFileNameFromUser(char *buffer, int maxLen, bool save);
 
 bool ApplyPatch(const PatchInfo &patch) {
@@ -585,6 +1051,9 @@ void ShowContextMenu(HWND hwnd, POINT pt) {
     AppendMenu(hMenu, MF_STRING, ID_MENU_TOGGLE_BPS_ALL, "Toggle BPs to All");
   }
 
+  AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
+  AppendMenu(hMenu, MF_STRING, ID_MENU_EXPORT_CSV, "Export Table To CSV");
+
   int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y,
                            0, hwnd, NULL);
   DestroyMenu(hMenu);
@@ -669,45 +1138,121 @@ LRESULT CALLBACK PatchWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     RECT rc;
     GetClientRect(hwnd, &rc);
     int editHeight = 35;
-    int chkWidth = 70; // Checkbox width (Increased for "Inv")
-    int spacing = 5;   // Spacing to avoid text overlap
+    int statusHeight = 30; // Status Bar Height
+    int chkWidth = 70;
+    int spacing = 25;
 
     int totalWidth = rc.right;
     int halfWidth = totalWidth / 2;
 
+    // Y coordinates
+    int bottomY = rc.bottom - statusHeight;
+    int filterY = bottomY - editHeight;
+
+    // --- Row 2 (Bottom): Status Area ---
+    // --- Row 2 (Bottom): Status Area ---
+    // [Regex (60)][Follow+Move (90)][Follow Above (90)][StatusText (Rest)]
+    int regexWidth = 60;
+    int followWidth = 140;
+    int followAboveWidth = 140;
+
+    hChkRegex = CreateWindow(
+        "BUTTON", "Regex", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, bottomY,
+        regexWidth, statusHeight, hwnd, (HMENU)ID_CHK_REGEX, hInst, NULL);
+    SendMessage(hChkRegex, BM_SETCHECK, BST_CHECKED, 0);
+
+    hChkFollowMove = CreateWindow(
+        "BUTTON", "Auto Next", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+        regexWidth + spacing, bottomY, followWidth, statusHeight, hwnd,
+        (HMENU)ID_CHK_FOLLOW_MOVE, hInst, NULL);
+
+    hChkFollowAbove = CreateWindow(
+        "BUTTON", "Follow", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+        regexWidth + spacing + followWidth + spacing, bottomY, 80, statusHeight,
+        hwnd, (HMENU)ID_CHK_FOLLOW_ABOVE, hInst, NULL);
+
+    // Edit box for number of lines
+    hEditFollowLines = CreateWindowEx(
+        WS_EX_CLIENTEDGE, "EDIT", "3",
+        WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_CENTER,
+        regexWidth + spacing + followWidth + spacing + 80 + 10, bottomY + 2, 30,
+        statusHeight - 4, hwnd, (HMENU)ID_EDIT_FOLLOW_LINES, hInst, NULL);
+    SendMessage(hEditFollowLines, EM_LIMITTEXT, 2, 0); // Limit to 2 chars
+
+    // "Above" Label
+    hStaticFollowLabel = CreateWindow(
+        "STATIC", "Above", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
+        regexWidth + spacing + followWidth + spacing + 80 + 10 + 30 + 10,
+        bottomY, 80, statusHeight, hwnd, (HMENU)ID_STATIC_FOLLOW_LABEL, hInst,
+        NULL);
+
+    // "ProAnalyze" Checkbox
+    hChkProAnalyze = CreateWindow("BUTTON", "ProAnalyze",
+                                  WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                                  regexWidth + spacing + followWidth + spacing +
+                                      80 + 10 + 30 + 10 + 80 + spacing,
+                                  bottomY, 180, statusHeight, hwnd,
+                                  (HMENU)ID_CHK_PRO_ANALYZE, hInst, NULL);
+
+    hChkFlattenLine = CreateWindow(
+        "BUTTON", "Flatten", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+        regexWidth + spacing + followWidth + spacing + 80 + 10 + 30 + 10 + 80 +
+            spacing + 180 + spacing,
+        bottomY, 80, statusHeight, hwnd, (HMENU)ID_CHK_FLATTEN_LINE, hInst,
+        NULL);
+
+    // Restore persistent state
+    SendMessage(hChkProAnalyze, BM_SETCHECK,
+                g_bProAnalyze ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessage(hChkFlattenLine, BM_SETCHECK,
+                g_bFlattenLine ? BST_CHECKED : BST_UNCHECKED, 0);
+    SetDlgItemInt(hwnd, ID_EDIT_FOLLOW_LINES, g_nFollowLines, FALSE);
+
+    int statusX = regexWidth + spacing + followWidth + spacing + 80 + 10 + 30 +
+                  10 + 80 + spacing + 180 + spacing + 80 +
+                  spacing; // Adjusted statusX for new checkbox
+    hStaticStatus = CreateWindow(
+        "STATIC", "Items: 0", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE | SS_RIGHT,
+        statusX, bottomY, totalWidth - statusX, statusHeight, hwnd,
+        (HMENU)ID_STATIC_STATUS, hInst, NULL);
+
+    // --- Row 1: Filters ---
+
     // Left Group: [Filter Edit Old][Gap][Inv Checkbox]
     // 1. Filter Edit Old
+
     hFilterEditOld = CreateWindowEx(
         WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0,
-        rc.bottom - editHeight, halfWidth - chkWidth - spacing, editHeight,
-        hwnd, (HMENU)IDC_EDIT_FILTER_OLD, hInst, NULL);
+        filterY, halfWidth - chkWidth - spacing, editHeight, hwnd,
+        (HMENU)IDC_EDIT_FILTER_OLD, hInst, NULL);
     SendMessage(hFilterEditOld, EM_SETCUEBANNER, FALSE,
                 (LPARAM)L"Filter Old...");
 
     // 2. Inverse Checkbox Old
     hChkInverseOld =
         CreateWindow("BUTTON", "Inv", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                     halfWidth - chkWidth, rc.bottom - editHeight, chkWidth,
-                     editHeight, hwnd, (HMENU)ID_CHK_INVERSE_OLD, hInst, NULL);
+                     halfWidth - chkWidth, filterY, chkWidth, editHeight, hwnd,
+                     (HMENU)ID_CHK_INVERSE_OLD, hInst, NULL);
 
     // Right Group: [Filter Edit New][Gap][Inv Checkbox]
     // 3. Filter Edit New
     hFilterEditNew = CreateWindowEx(
         WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-        halfWidth, rc.bottom - editHeight, halfWidth - chkWidth - spacing,
-        editHeight, hwnd, (HMENU)IDC_EDIT_FILTER_NEW, hInst, NULL);
+        halfWidth, filterY, halfWidth - chkWidth - spacing, editHeight, hwnd,
+        (HMENU)IDC_EDIT_FILTER_NEW, hInst, NULL);
     SendMessage(hFilterEditNew, EM_SETCUEBANNER, FALSE,
                 (LPARAM)L"Filter New...");
 
     // 4. Inverse Checkbox New
     hChkInverseNew =
         CreateWindow("BUTTON", "Inv", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                     rc.right - chkWidth, rc.bottom - editHeight, chkWidth,
-                     editHeight, hwnd, (HMENU)ID_CHK_INVERSE_NEW, hInst, NULL);
+                     rc.right - chkWidth, filterY, chkWidth, editHeight, hwnd,
+                     (HMENU)ID_CHK_INVERSE_NEW, hInst, NULL);
 
     hList = CreateWindowEx(0, WC_LISTVIEW, "",
-                           WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL,
-                           0, 0, rc.right, rc.bottom - editHeight, hwnd,
+                           WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL |
+                               LVS_OWNERDATA | LVS_SHOWSELALWAYS,
+                           0, 0, rc.right, filterY, hwnd,
                            (HMENU)IDC_LIST_PATCHES, hInst, NULL);
 
     ListView_SetExtendedListViewStyle(hList,
@@ -759,26 +1304,73 @@ LRESULT CALLBACK PatchWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     RECT rc;
     GetClientRect(hwnd, &rc);
     int editHeight = 35;
+    int statusHeight = 30;
+    int regexWidth = 60;
+    int followWidth = 140;
+    int followAboveWidth = 140;
     int chkWidth = 70;
-    int spacing = 5;
-    int halfWidth = rc.right / 2;
+    int spacing = 25;
+    int totalWidth = rc.right;
+    int halfWidth = totalWidth / 2;
 
     if (hList && hFilterEditOld && hFilterEditNew && hChkInverseOld &&
-        hChkInverseNew) {
-      SetWindowPos(hList, NULL, 0, 0, rc.right, rc.bottom - editHeight,
-                   SWP_NOZORDER);
+        hChkInverseNew && hChkRegex && hChkFollowMove && hChkFollowAbove &&
+        hStaticStatus) {
 
+      // Status Row Y
+      int bottomY = rc.bottom - statusHeight;
+      // Filter Row Y
+      int filterY = bottomY - editHeight;
+
+      // List View Height = filterY
+      SetWindowPos(hList, NULL, 0, 0, rc.right, filterY, SWP_NOZORDER);
+
+      // Row 2: Status Area [Regex][Follow][FollowAbove][Status]
+      SetWindowPos(hChkRegex, NULL, 0, bottomY, regexWidth, statusHeight,
+                   SWP_NOZORDER);
+      SetWindowPos(hChkFollowMove, NULL, regexWidth + spacing, bottomY,
+                   followWidth, statusHeight, SWP_NOZORDER);
+
+      SetWindowPos(hChkFollowAbove, NULL,
+                   regexWidth + spacing + followWidth + spacing, bottomY, 80,
+                   statusHeight, SWP_NOZORDER);
+
+      SetWindowPos(hEditFollowLines, NULL,
+                   regexWidth + spacing + followWidth + spacing + 80 + 10,
+                   bottomY + 2, 30, statusHeight - 4, SWP_NOZORDER);
+
+      SetWindowPos(hStaticFollowLabel, NULL,
+                   regexWidth + spacing + followWidth + spacing + 80 + 10 + 30 +
+                       10,
+                   bottomY, 80, statusHeight, SWP_NOZORDER);
+
+      SetWindowPos(hChkProAnalyze, NULL,
+                   regexWidth + spacing + followWidth + spacing + 80 + 10 + 30 +
+                       10 + 80 + spacing,
+                   bottomY, 180, statusHeight, SWP_NOZORDER);
+
+      SetWindowPos(hChkFlattenLine, NULL,
+                   regexWidth + spacing + followWidth + spacing + 80 + 10 + 30 +
+                       10 + 80 + spacing + 180 + spacing,
+                   bottomY, 80, statusHeight, SWP_NOZORDER);
+
+      int statusX = regexWidth + spacing + followWidth + spacing + 80 + 10 +
+                    30 + 10 + 80 + spacing + 180 + spacing + 80 + spacing;
+      SetWindowPos(hStaticStatus, NULL, statusX, bottomY, totalWidth - statusX,
+                   statusHeight, SWP_NOZORDER);
+
+      // Row 1: Filters
       // Left Group: [Filter Edit Old][Gap][Inv Checkbox]
-      SetWindowPos(hFilterEditOld, NULL, 0, rc.bottom - editHeight,
+      SetWindowPos(hFilterEditOld, NULL, 0, filterY,
                    halfWidth - chkWidth - spacing, editHeight, SWP_NOZORDER);
-      SetWindowPos(hChkInverseOld, NULL, halfWidth - chkWidth,
-                   rc.bottom - editHeight, chkWidth, editHeight, SWP_NOZORDER);
+      SetWindowPos(hChkInverseOld, NULL, halfWidth - chkWidth, filterY,
+                   chkWidth, editHeight, SWP_NOZORDER);
 
       // Right Group: [Filter Edit New][Gap][Inv Checkbox]
-      SetWindowPos(hFilterEditNew, NULL, halfWidth, rc.bottom - editHeight,
+      SetWindowPos(hFilterEditNew, NULL, halfWidth, filterY,
                    halfWidth - chkWidth - spacing, editHeight, SWP_NOZORDER);
-      SetWindowPos(hChkInverseNew, NULL, rc.right - chkWidth,
-                   rc.bottom - editHeight, chkWidth, editHeight, SWP_NOZORDER);
+      SetWindowPos(hChkInverseNew, NULL, rc.right - chkWidth, filterY, chkWidth,
+                   editHeight, SWP_NOZORDER);
     }
     break;
   }
@@ -786,10 +1378,65 @@ LRESULT CALLBACK PatchWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     LPNMHDR pnmh = (LPNMHDR)lParam;
     if (pnmh->idFrom == IDC_LIST_PATCHES) {
       switch (pnmh->code) {
+      case LVN_GETDISPINFO: {
+        NMLVDISPINFO *pDispInfo = (NMLVDISPINFO *)lParam;
+        if (pDispInfo->item.mask & LVIF_TEXT) {
+          int iItem = pDispInfo->item.iItem;
+          if (iItem >= 0 && iItem < (int)g_Patches.size()) {
+            const auto &patch = g_Patches[iItem];
+            switch (pDispInfo->item.iSubItem) {
+            case 0: // Address
+              snprintf(pDispInfo->item.pszText, pDispInfo->item.cchTextMax,
+                       "%08X", (unsigned int)patch.address);
+              break;
+            case 1: // Old Bytes
+            {
+              std::string s = BytesToHex(patch.oldBytes);
+              strncpy(pDispInfo->item.pszText, s.c_str(),
+                      pDispInfo->item.cchTextMax);
+            } break;
+            case 2: // New Bytes
+            {
+              std::string s = BytesToHex(patch.newBytes);
+              strncpy(pDispInfo->item.pszText, s.c_str(),
+                      pDispInfo->item.cchTextMax);
+            } break;
+            case 3: // Old Disasm
+              strncpy(pDispInfo->item.pszText, patch.oldDisasm.c_str(),
+                      pDispInfo->item.cchTextMax);
+              break;
+            case 4: // New Disasm
+              strncpy(pDispInfo->item.pszText, patch.disasm.c_str(),
+                      pDispInfo->item.cchTextMax);
+              break;
+            case 5: // Comment
+              strncpy(pDispInfo->item.pszText, patch.comment.c_str(),
+                      pDispInfo->item.cchTextMax);
+              break;
+            }
+          }
+        }
+        break;
+      }
       case NM_DBLCLK: {
         int iItem = ListView_GetNextItem(hList, -1, LVNI_SELECTED);
-        if (iItem != -1)
+        if (iItem != -1) {
           ExecuteAction(hwnd, ID_MENU_DISASM, iItem);
+
+          // Follow + Move Logic
+          if (hChkFollowMove &&
+              SendMessage(hChkFollowMove, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+            int nextItem = iItem + 1;
+            if (nextItem < (int)g_Patches.size()) {
+              // Clear current selection? In SingleSel mode, setting another
+              // selects it usually.
+              ListView_SetItemState(hList, nextItem,
+                                    LVIS_SELECTED | LVIS_FOCUSED,
+                                    LVIS_SELECTED | LVIS_FOCUSED);
+              ListView_EnsureVisible(hList, nextItem, FALSE);
+            }
+          }
+        }
         break;
       }
       case NM_RCLICK: {
@@ -859,14 +1506,13 @@ LRESULT CALLBACK PatchWndProc(HWND hwnd, UINT msg, WPARAM wParam,
               }
             }
 
-            // 3. Selection Override (User Request: Pale Blue)
-            // If selected, we override BACKGROUND ONLY to Pale Blue.
-            // Text color remains whatever we calculated above (Black, Dark
-            // Green, or Dark Blue).
+            // 3. Selection
+            // Let the system handle the selection highlight (Standard Blue)
+            // to avoid issues with sub-item state persistence.
             if (pnmcd->nmcd.uItemState & CDIS_SELECTED) {
-              bkColor = RGB(225, 240, 255); // Pale Blue
-              pnmcd->nmcd.uItemState &=
-                  ~CDIS_SELECTED; // Custom selection color
+              // If we want to override colors, we can try here, but
+              // removing CDIS_SELECTED breaks the chain.
+              // We will rely on default Highlighting.
             }
 
             // Apply final colors
@@ -897,10 +1543,33 @@ LRESULT CALLBACK PatchWndProc(HWND hwnd, UINT msg, WPARAM wParam,
 
     case ID_CHK_INVERSE_OLD:
     case ID_CHK_INVERSE_NEW:
+    case ID_CHK_REGEX:
       // Only respond to click events
       if (HIWORD(wParam) == BN_CLICKED) {
         ApplyFilter();
         UpdateListView();
+      }
+      break;
+
+    case ID_CHK_PRO_ANALYZE:
+      if (HIWORD(wParam) == BN_CLICKED) {
+        g_bProAnalyze =
+            (SendMessage((HWND)lParam, BM_GETCHECK, 0, 0) == BST_CHECKED);
+      }
+      break;
+    case ID_CHK_FLATTEN_LINE:
+      if (HIWORD(wParam) == BN_CLICKED) {
+        g_bFlattenLine =
+            (SendMessage((HWND)lParam, BM_GETCHECK, 0, 0) == BST_CHECKED);
+      }
+      break;
+
+    case ID_EDIT_FOLLOW_LINES:
+      if (HIWORD(wParam) == EN_CHANGE) {
+        BOOL trans = FALSE;
+        int val = GetDlgItemInt(hwnd, ID_EDIT_FOLLOW_LINES, &trans, FALSE);
+        if (trans && val > 0 && val < 100)
+          g_nFollowLines = val;
       }
       break;
 
@@ -917,6 +1586,29 @@ LRESULT CALLBACK PatchWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       char filepath[MAX_PATH];
       if (GetFileNameFromUser(filepath, MAX_PATH, true))
         ExportPatches(filepath);
+      break;
+    }
+
+    case ID_MENU_EXPORT_CSV: {
+      char filepath[MAX_PATH] = {0};
+      OPENFILENAMEA ofn = {0};
+      ofn.lStructSize = sizeof(ofn);
+      ofn.hwndOwner = hwnd;
+      ofn.lpstrFilter = "CSV Files (*.csv)\0*.csv\0All Files (*.*)\0*.*\0";
+      ofn.lpstrFile = filepath;
+      ofn.nMaxFile = MAX_PATH;
+      ofn.Flags = OFN_EXPLORER | OFN_OVERWRITEPROMPT;
+      ofn.lpstrDefExt = "csv";
+
+      if (GetSaveFileNameA(&ofn)) {
+        if (ExportTableToCSV(filepath)) {
+          MessageBoxA(hwnd, "Table exported successfully!", "Success",
+                      MB_OK | MB_ICONINFORMATION);
+        } else {
+          MessageBoxA(hwnd, "Failed to export table.", "Error",
+                      MB_OK | MB_ICONERROR);
+        }
+      }
       break;
     }
     case ID_MENU_REFRESH: {
@@ -954,12 +1646,12 @@ LRESULT CALLBACK PatchWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         // Restore each patch to its old bytes
         for (const auto &patch : g_Patches) {
           bool allRestored = true;
-          for (size_t k = 0; k < patch.oldBytes.size(); ++k) {
-            duint addr = patch.address + k;
-            unsigned char oldByte = patch.oldBytes[k];
-            if (!dbgFuncs->MemPatch(addr, &oldByte, 1)) {
-              allRestored = false;
-            }
+          // Optimization: Write entire oldBytes buffer at once
+          if (dbgFuncs->MemPatch(patch.address, patch.oldBytes.data(),
+                                 patch.oldBytes.size())) {
+            allRestored = true;
+          } else {
+            allRestored = false;
           }
           if (allRestored) {
             successCount++;
@@ -978,7 +1670,169 @@ LRESULT CALLBACK PatchWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       break;
     }
 
-    case ID_MENU_DISASM:
+    case ID_MENU_DISASM: {
+      int iItem = ListView_GetNextItem(hList, -1, LVNI_SELECTED);
+      if (iItem != -1) {
+        ExecuteAction(hwnd, ID_MENU_DISASM, iItem);
+
+        // Helper for Follow Above
+        auto followAbove = [&]() {
+          if (hChkFollowAbove &&
+              SendMessage(hChkFollowAbove, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+            duint currentAddr = g_Patches[iItem].head;
+
+            // Read custom lines from edit box
+            // Read custom lines from persistent global
+            int lines = g_nFollowLines;
+
+            duint target = currentAddr;
+            char buf[256];
+
+            // Always Log global state
+            bool useProAnalyze = g_bProAnalyze;
+
+            Log("[PatchKing] Follow Above: %d lines from 0x%llX (ProAnalyze: "
+                "%s)\n",
+                lines, (unsigned long long)currentAddr,
+                useProAnalyze ? "ON" : "OFF");
+
+            if (lines >= 4) {
+              // Advanced Strategy for Lines >= 4 (User Requested Heuristic)
+              // 1. Shift back 0xE (approx 14 bytes) to jump ~4 instructions
+              duint base = currentAddr - 0xE;
+
+              // 2. Align to instruction head using dis.prev
+              sprintf(buf, "dis.prev(0x%llX)", (unsigned long long)base);
+              target = DbgValFromString(buf);
+              Log("[PatchKing]   Heuristic Base:0x%llX -> Aligned:0x%llX\n",
+                  (unsigned long long)base, (unsigned long long)target);
+
+              // 3. Backtrack remaining steps (lines - 4)
+              int backSteps = lines - 4;
+              for (int k = 0; k < backSteps; k++) {
+                sprintf(buf, "dis.prev(0x%llX)", (unsigned long long)target);
+                duint prev = DbgValFromString(buf);
+                Log("[PatchKing]   Step(Heuristic) %d: 0x%llX -> 0x%llX\n",
+                    k + 1, (unsigned long long)target,
+                    (unsigned long long)prev);
+                target = prev;
+              }
+            } else {
+              // Simple Strategy for Lines < 4 using direct dis.prev
+              // This replaces the old unreliable scan logic
+              for (int i = 0; i < lines; i++) {
+                sprintf(buf, "dis.prev(0x%llX)", (unsigned long long)target);
+                duint prev = DbgValFromString(buf);
+                Log("[PatchKing]   Step(Simple) %d: 0x%llX -> 0x%llX\n", i + 1,
+                    (unsigned long long)target, (unsigned long long)prev);
+                target = prev;
+              }
+            }
+
+            // --- PRO ANALYZE CORRECTION ---
+            // If ProAnalyze is ON, use the found 'target' as a sync point to
+            // scan FORWARD to find the TRUE instruction covering currentAddr.
+            // Then backtrack from THERE.
+            duint finalTop = target;
+            duint selectionAddr = currentAddr;
+
+            if (useProAnalyze) {
+              duint syncPoint = target; // Start scanning from where we landed
+              duint trueHead = 0;
+              duint scanCur = syncPoint;
+
+              Log("[PatchKing]   ProAnalyze: Scanning forward from SyncPoint "
+                  "0x%llX to find 0x%llX\n",
+                  (unsigned long long)syncPoint,
+                  (unsigned long long)currentAddr);
+
+              // Scan forward max 30 instructions to avoid infinite loops
+              for (int i = 0; i < 30; i++) {
+                BASIC_INSTRUCTION_INFO instr;
+                unsigned char data[16];
+                memset(&instr, 0, sizeof(instr));
+                if (DbgMemRead(scanCur, data, 16) &&
+                    DbgFunctions()->DisasmFast(data, scanCur, &instr)) {
+                  duint next = scanCur + instr.size;
+                  // Check if this instruction COVERS currentAddr
+                  // i.e. scanCur <= currentAddr < next
+                  if (scanCur <= currentAddr && currentAddr < next) {
+                    trueHead = scanCur;
+                    Log("[PatchKing]   ProAnalyze: Found TrueHead 0x%llX (Size "
+                        "%d) covering target\n",
+                        (unsigned long long)trueHead, instr.size);
+                    break;
+                  }
+                  scanCur = next;
+                  if (scanCur > currentAddr) {
+                    Log("[PatchKing]   ProAnalyze: Overshot target without "
+                        "match (ScanCur 0x%llX > Target)\n",
+                        (unsigned long long)scanCur);
+                    break;
+                  }
+                } else {
+                  scanCur++; // Byte step if disasm fails
+                }
+              }
+
+              if (trueHead != 0) {
+                selectionAddr = trueHead;
+                // Now Backtrack 'lines' steps from THIS true head to get the
+                // final display address Logic duplication - Backtrack from
+                // trueHead
+                if (lines >= 4) {
+                  duint base = trueHead - 0xE;
+                  sprintf(buf, "dis.prev(0x%llX)", (unsigned long long)base);
+                  duint aligned = DbgValFromString(buf);
+                  int backSteps = lines - 4;
+                  duint tempT = aligned;
+                  for (int k = 0; k < backSteps; k++) {
+                    sprintf(buf, "dis.prev(0x%llX)", (unsigned long long)tempT);
+                    tempT = DbgValFromString(buf);
+                  }
+                  finalTop = tempT;
+                } else {
+                  duint tempT = trueHead;
+                  for (int i = 0; i < lines; i++) {
+                    sprintf(buf, "dis.prev(0x%llX)", (unsigned long long)tempT);
+                    tempT = DbgValFromString(buf);
+                  }
+                  finalTop = tempT;
+                }
+                Log("[PatchKing]   ProAnalyze: Final Corrected Top: 0x%llX\n",
+                    (unsigned long long)finalTop);
+              } else {
+                Log("[PatchKing]   ProAnalyze: Failed to find TrueHead, "
+                    "falling back to original logic.\n");
+              }
+            }
+
+            // Display at newTop, but keep selection at currentAddr
+            GuiDisasmAt(finalTop, selectionAddr);
+          }
+        };
+
+        followAbove();
+
+        // Follow + Move Logic
+        if (hChkFollowMove &&
+            SendMessage(hChkFollowMove, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+          int nextItem = iItem + 1;
+          if (nextItem < (int)g_Patches.size()) {
+            // Explicitly clear old selection to ensure visual update
+            ListView_SetItemState(hList, iItem, 0,
+                                  LVIS_SELECTED | LVIS_FOCUSED);
+            // Set new selection
+            ListView_SetItemState(hList, nextItem, LVIS_SELECTED | LVIS_FOCUSED,
+                                  LVIS_SELECTED | LVIS_FOCUSED);
+            ListView_EnsureVisible(hList, nextItem, FALSE);
+            UpdateWindow(hList); // Force repaint
+          }
+        }
+      }
+      break;
+    }
+
     case ID_MENU_APPLY:
     case ID_MENU_RESTORE:
     case ID_MENU_DELETE: {
@@ -1181,8 +2035,8 @@ bool ImportAndApplyPatches(const char *filepath) {
       patched = true;
     }
 
-    // Attempt 2: RVA (ImageBase + Addr) - PRIORITY per User Request ("Default
-    // add ImageBase")
+    // Attempt 2: RVA (ImageBase + Addr) - PRIORITY per User Request
+    // ("Default add ImageBase")
     if (!patched && imageBase != 0) {
       if (dbgFuncs->MemPatch(imageBase + addr, &newB, 1)) {
         Log("[PatchMgr] Line %d: Patched via RVA (%p + %p -> %p)\n", lineNum,
@@ -1192,8 +2046,8 @@ bool ImportAndApplyPatches(const char *filepath) {
     }
 
     // Attempt 3: File Offset -> VA (Fallback)
-    // Only used if RVA failed (e.g. address wasn't a valid RVA or memory not
-    // mapped there)
+    // Only used if RVA failed (e.g. address wasn't a valid RVA or memory
+    // not mapped there)
     if (!patched && dbgFuncs->FileOffsetToVa && mainModName[0] != 0) {
       duint va = dbgFuncs->FileOffsetToVa(mainModName, addr);
       if (va != 0 && dbgFuncs->MemPatch(va, &newB, 1)) {
@@ -1244,6 +2098,46 @@ bool ExportPatches(const char *filepath) {
           (k < p.newBytes.size()) ? p.newBytes[k] : 0; // Should match size
       fprintf(fp, "%p:%02X->%02X\n", (void *)currentAddr, oldB, newB);
     }
+  }
+
+  fclose(fp);
+  return true;
+}
+
+bool ExportTableToCSV(const char *filepath) {
+  FILE *fp = fopen(filepath, "w");
+  if (!fp)
+    return false;
+
+  // Write UTF-8 BOM
+  fputc(0xEF, fp);
+  fputc(0xBB, fp);
+  fputc(0xBF, fp);
+
+  fprintf(fp, "Address,Module,Old Bytes,New Bytes,Old Instruction,New "
+              "Instruction,Comment\n");
+
+  auto safeObj = [](const std::string &s) {
+    std::string out = "\"";
+    for (char c : s) {
+      if (c == '"')
+        out += "\"\"";
+      else
+        out += c;
+    }
+    out += "\"";
+    return out;
+  };
+
+  for (const auto &p : g_Patches) {
+    char addrBuf[32];
+    sprintf(addrBuf, "%p", (void *)p.address);
+
+    fprintf(
+        fp, "%s,%s,%s,%s,%s,%s,%s\n", addrBuf, safeObj(p.moduleName).c_str(),
+        safeObj(BytesToHex(p.oldBytes)).c_str(),
+        safeObj(BytesToHex(p.newBytes)).c_str(), safeObj(p.oldDisasm).c_str(),
+        safeObj(p.disasm).c_str(), safeObj(p.comment).c_str());
   }
 
   fclose(fp);
