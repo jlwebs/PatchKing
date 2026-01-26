@@ -1,7 +1,8 @@
 #include "PatchWindow.h"
 #include "icon_data.h" // For Window Icon
 #include "pluginmain.h"
-#include "pluginsdk/_scriptapi_module.h"
+
+#include "save.h"
 #include <algorithm>
 #include <commctrl.h>
 #include <iomanip>
@@ -28,7 +29,8 @@
 #define ID_MENU_RESTORE 2007
 #define ID_MENU_LOAD 2008
 #define ID_MENU_SAVE 2009
-#define ID_MENU_REMOVE_ALL_IN_LIST 2010
+#define ID_MENU_RESTORE_ALL_IN_LIST 2010
+#define ID_MENU_CLEAR_ALL_IN_LIST 2013
 #define ID_MENU_TOGGLE_BPS_ALL 2011
 #define ID_MENU_EXPORT_CSV 2012
 
@@ -376,6 +378,7 @@ static void ResolvePatchDetails(PatchInfo &p, bool fastMode, bool useProAnalyze,
     p.disasm = dInstr.instruction;
   } else {
     GetRichDisassembly(p.head, p.disasm);
+    p.disasm = Utf8ToAnsi(p.disasm); // Fix Chinese Chars
     // We still need dInstr for operand info later
     DbgDisasmAt(p.head, &dInstr);
   }
@@ -393,6 +396,7 @@ static void ResolvePatchDetails(PatchInfo &p, bool fastMode, bool useProAnalyze,
     p.oldDisasm = bInfo.instruction;
     if (!fastMode) {
       EnhanceOldDisassembly(p.oldDisasm);
+      p.oldDisasm = Utf8ToAnsi(p.oldDisasm); // Fix Chinese Chars
     }
   }
 
@@ -923,10 +927,8 @@ extern "C" __declspec(dllimport) void GuiUpdateAllViews();
 extern "C" __declspec(dllimport) void GuiUpdateDisassemblyView();
 extern "C" __declspec(dllimport) void GuiRepaintTableView();
 
-bool ImportAndApplyPatches(const char *filepath);
-bool ExportPatches(const char *filepath);
-bool ExportTableToCSV(const char *filepath);
-bool GetFileNameFromUser(char *buffer, int maxLen, bool save);
+bool GetFileNameFromUser(char *buffer, int maxLen, bool save,
+                         int *outFilterIndex = nullptr);
 
 bool ApplyPatch(const PatchInfo &patch) {
   if (patch.newBytes.empty())
@@ -1036,8 +1038,9 @@ void ShowContextMenu(HWND hwnd, POINT pt) {
   AppendMenu(hMenu, MF_STRING, ID_MENU_SAVE, "Export Patch File...\tCtrl+S");
   AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
   AppendMenu(hMenu, MF_STRING, ID_MENU_REFRESH, "Refresh\tF5");
-  AppendMenu(hMenu, MF_STRING, ID_MENU_REMOVE_ALL_IN_LIST,
-             "Remove All in List");
+  AppendMenu(hMenu, MF_STRING, ID_MENU_RESTORE_ALL_IN_LIST,
+             "Restore All in List");
+  AppendMenu(hMenu, MF_STRING, ID_MENU_CLEAR_ALL_IN_LIST, "Clear All in List");
 
   int iItem = ListView_GetNextItem(hList, -1, LVNI_SELECTED);
   if (iItem != -1) {
@@ -1576,7 +1579,7 @@ LRESULT CALLBACK PatchWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     case ID_MENU_LOAD: {
       char filepath[MAX_PATH];
       if (GetFileNameFromUser(filepath, MAX_PATH, false)) {
-        if (ImportAndApplyPatches(filepath)) {
+        if (ImportAndApplyPatches(hwnd, filepath)) {
           RefreshPatchList();
         }
       }
@@ -1584,8 +1587,32 @@ LRESULT CALLBACK PatchWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     }
     case ID_MENU_SAVE: {
       char filepath[MAX_PATH];
-      if (GetFileNameFromUser(filepath, MAX_PATH, true))
-        ExportPatches(filepath);
+      int filterIndex = 0;
+      if (GetFileNameFromUser(filepath, MAX_PATH, true, &filterIndex)) {
+        // Auto-Append Extension
+        std::string path(filepath);
+        size_t lastDot = path.find_last_of('.');
+        size_t lastSlash = path.find_last_of("\\/");
+        bool hasExt = (lastDot != std::string::npos &&
+                       (lastSlash == std::string::npos || lastDot > lastSlash));
+
+        if (!hasExt) {
+          if (filterIndex == 1)
+            path += ".patchking";
+          else if (filterIndex == 2)
+            path += ".1337";
+        }
+
+        // Determine format based on extension or filter
+        bool asPatchKing = (filterIndex == 1);
+        // Fallback: Check extension if filter used was All Files or mismatches
+        if (path.size() >= 10 &&
+            _stricmp(path.c_str() + path.size() - 10, ".patchking") == 0) {
+          asPatchKing = true;
+        }
+
+        ExportPatches(path.c_str(), asPatchKing);
+      }
       break;
     }
 
@@ -1616,56 +1643,94 @@ LRESULT CALLBACK PatchWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       break;
     }
 
-    case ID_MENU_REMOVE_ALL_IN_LIST: {
-      // Remove all patches that are currently visible in the filtered list
+    case ID_MENU_RESTORE_ALL_IN_LIST: {
       if (g_Patches.empty()) {
-        MessageBoxA(hwnd, "No patches in the current list to remove.",
-                    "Remove All", MB_ICONINFORMATION);
+        MessageBoxA(hwnd, "No patches in the current list to restore.",
+                    "Restore All", MB_ICONINFORMATION);
         break;
       }
-
       char msg[256];
       sprintf(msg,
-              "Remove all %d patches in the current list from the "
-              "debugger?\n\nThis will restore them to their original bytes.",
+              "Restore all %d patches in the current list?\n\n(This will "
+              "revert bytes but keep entries in the list)",
               (int)g_Patches.size());
-      int result = MessageBoxA(hwnd, msg, "Confirm Remove All",
-                               MB_YESNO | MB_ICONQUESTION);
-
-      if (result == IDYES) {
+      if (MessageBoxA(hwnd, msg, "Confirm Restore All",
+                      MB_YESNO | MB_ICONQUESTION) == IDYES) {
         const DBGFUNCTIONS *dbgFuncs = DbgFunctions();
-        if (!dbgFuncs || !dbgFuncs->MemPatch) {
-          MessageBoxA(hwnd, "MemPatch API not available", "Error",
-                      MB_ICONERROR);
+        if (!dbgFuncs || !dbgFuncs->MemPatch)
           break;
-        }
-
         int successCount = 0;
-        int failCount = 0;
-
-        // Restore each patch to its old bytes
         for (const auto &patch : g_Patches) {
-          bool allRestored = true;
-          // Optimization: Write entire oldBytes buffer at once
           if (dbgFuncs->MemPatch(patch.address, patch.oldBytes.data(),
                                  patch.oldBytes.size())) {
-            allRestored = true;
-          } else {
-            allRestored = false;
-          }
-          if (allRestored) {
             successCount++;
-          } else {
-            failCount++;
+          }
+        }
+        GuiUpdateAllViews();
+        // IMPORTANT: Do NOT call RefreshPatchList() to avoid re-syncing from
+        // DBG which might hide them. Just redraw list to update colors (green
+        // -> white/red).
+        if (hList)
+          InvalidateRect(hList, NULL, TRUE);
+        sprintf(msg, "Restored: %d", successCount);
+        MessageBoxA(hwnd, msg, "Result", MB_ICONINFORMATION);
+      }
+      break;
+    }
+
+    case ID_MENU_CLEAR_ALL_IN_LIST: {
+      if (g_Patches.empty()) {
+        MessageBoxA(hwnd, "No patches in the current list to clear.",
+                    "Clear All", MB_ICONINFORMATION);
+        break;
+      }
+      char msg[256];
+      sprintf(msg,
+              "Restore AND Remove all %d patches in the current list?\n\n(This "
+              "will revert bytes and remove entries from the view)",
+              (int)g_Patches.size());
+      if (MessageBoxA(hwnd, msg, "Confirm Clear All",
+                      MB_YESNO | MB_ICONWARNING) == IDYES) {
+        const DBGFUNCTIONS *dbgFuncs = DbgFunctions();
+        if (!dbgFuncs || !dbgFuncs->MemPatch)
+          break;
+        int successCount = 0;
+        for (const auto &patch : g_Patches) {
+          if (dbgFuncs->MemPatch(patch.address, patch.oldBytes.data(),
+                                 patch.oldBytes.size())) {
+            successCount++;
           }
         }
 
-        GuiUpdateAllViews();
-        RefreshPatchList();
+        // Remove from g_AllPatches
+        // Naive Approach: Rebuild g_AllPatches excluding g_Patches contents.
+        // Since g_Patches is a subset (filtered), we must be careful.
+        // Optimization: Use address as ID.
+        std::vector<PatchInfo> newAll;
+        newAll.reserve(g_AllPatches.size());
 
-        sprintf(msg, "Batch removal complete.\n\nRestored: %d\nFailed: %d",
-                successCount, failCount);
-        MessageBoxA(hwnd, msg, "Remove All Result", MB_ICONINFORMATION);
+        for (const auto &allP : g_AllPatches) {
+          bool removing = false;
+          for (const auto &p : g_Patches) {
+            if (p.address == allP.address && p.oldBytes == allP.oldBytes) {
+              removing = true;
+              break;
+            }
+          }
+          if (!removing) {
+            newAll.push_back(allP);
+          }
+        }
+        g_AllPatches = std::move(newAll);
+
+        // Clear g_Patches (current view)
+        g_Patches.clear();
+
+        GuiUpdateAllViews();
+        UpdateListView(); // Just update UI, don't re-sync from debugger!
+
+        sprintf(msg, "Restored and Cleared: %d", successCount);
+        MessageBoxA(hwnd, msg, "Result", MB_ICONINFORMATION);
       }
       break;
     }
@@ -1916,230 +1981,30 @@ void ClosePatchWindow() {
     SendMessage(hPatchWindow, WM_CLOSE, 0, 0);
 }
 
-bool GetFileNameFromUser(char *buffer, int maxLen, bool save) {
+bool GetFileNameFromUser(char *buffer, int maxLen, bool save,
+                         int *outFilterIndex) {
   OPENFILENAME ofn = {0};
   ofn.lStructSize = sizeof(ofn);
   ofn.hwndOwner = hPatchWindow;
-  ofn.lpstrFilter =
-      "Patch Files (*.txt;*.patch;*.1337)\0*.txt;*.patch;*.1337\0All Files "
-      "(*.*)\0*.*\0";
+
+  if (save) {
+    ofn.lpstrFilter = "PatchKing File (*.patchking)\0*.patchking\0x64dbg Patch "
+                      "File (*.1337)\0*.1337\0All Files (*.*)\0*.*\0";
+  } else {
+    ofn.lpstrFilter =
+        "Patch Files "
+        "(*.txt;*.patch;*.1337;*.patchking)\0*.txt;*.patch;*.1337;"
+        "*.patchking\0All Files (*.*)\0*.*\0";
+  }
+
   ofn.lpstrFile = buffer;
   ofn.nMaxFile = maxLen;
   ofn.Flags = OFN_EXPLORER | (save ? OFN_OVERWRITEPROMPT : OFN_FILEMUSTEXIST);
   buffer[0] = '\0';
-  return save ? GetSaveFileNameA(&ofn) : GetOpenFileNameA(&ofn);
-}
 
-bool ImportAndApplyPatches(const char *filepath) {
-  FILE *fp = fopen(filepath, "r");
-  if (!fp) {
-    MessageBoxA(hPatchWindow, "Failed to open file!", "Error", MB_ICONERROR);
-    return false;
+  bool result = save ? GetSaveFileNameA(&ofn) : GetOpenFileNameA(&ofn);
+  if (result && outFilterIndex) {
+    *outFilterIndex = ofn.nFilterIndex;
   }
-
-  const DBGFUNCTIONS *dbgFuncs = DbgFunctions();
-  if (!dbgFuncs || !dbgFuncs->MemPatch) {
-    fclose(fp);
-    MessageBoxA(hPatchWindow, "Debugger not ready (MemPatch unavailable).",
-                "Error", MB_ICONERROR);
-    return false;
-  }
-
-  // Strategy A: Robust ImageBase Resolution
-  duint imageBase = 0;
-
-  // 1. Try Script API (Most Reliable for Main PE)
-  imageBase = Script::Module::GetMainModuleBase();
-  Log("[PatchMgr] GetMainModuleBase() returned: %p\n", (void *)imageBase);
-
-  // 2. Try DbgEval if Script API failed
-  if (imageBase == 0 && dbgFuncs->ValFromString) {
-    dbgFuncs->ValFromString("imagebase", &imageBase);
-    Log("[PatchMgr] ValFromString('imagebase') returned: %p\n",
-        (void *)imageBase);
-  }
-
-  // 3. Fallback: Use CIP (Current Instruction Pointer) module base if
-  // imagebase failed
-  // 3. Fallback: Use CIP (Current Instruction Pointer) module base if
-  // imagebase failed
-  if (imageBase == 0) {
-    duint cip = 0;
-    if (dbgFuncs->ValFromString)
-      dbgFuncs->ValFromString("cip", &cip);
-
-    if ((cip != 0) && dbgFuncs->ModBaseFromAddr) {
-      imageBase = dbgFuncs->ModBaseFromAddr(cip);
-      Log("[PatchMgr] Fallback to CIP Base: %p\n", (void *)imageBase);
-    }
-  }
-
-  // Get Module Name for FileOffsetToVa (Safe Usage)
-  char mainModName[MAX_MODULE_SIZE] = {0};
-  if (imageBase != 0 && dbgFuncs->ModNameFromAddr) {
-    dbgFuncs->ModNameFromAddr(imageBase, mainModName, false);
-    Log("[PatchMgr] Main Module Name: %s\n", mainModName);
-  }
-
-  char buffer[512];
-  int successCount = 0;
-  int failCount = 0;
-  int lineNum = 0;
-
-  while (fgets(buffer, sizeof(buffer), fp)) {
-    lineNum++;
-    std::string line(buffer);
-
-    // Trim
-    while (!line.empty() && (isspace((unsigned char)line.back())))
-      line.pop_back();
-    while (!line.empty() && (isspace((unsigned char)line.front())))
-      line.erase(0, 1);
-
-    if (line.empty() || line[0] == '#' || line[0] == ';' || line[0] == '>')
-      continue;
-
-    // Parse
-    size_t col = line.find(':');
-    size_t arr = line.find("->");
-
-    duint addr = 0;
-    unsigned char newB = 0;
-    bool validParse = false;
-
-    try {
-      if (col != std::string::npos && arr != std::string::npos && arr > col) {
-        addr = (duint)std::stoull(line.substr(0, col), nullptr, 16);
-        newB = (unsigned char)std::stoul(line.substr(arr + 2), nullptr, 16);
-        validParse = true;
-      } else if (col != std::string::npos) {
-        addr = (duint)std::stoull(line.substr(0, col), nullptr, 16);
-        newB = (unsigned char)std::stoul(line.substr(col + 1), nullptr, 16);
-        validParse = true;
-      }
-    } catch (...) {
-      Log("[PatchMgr] Line %d: Parse error '%s'\n", lineNum, line.c_str());
-      failCount++;
-      continue;
-    }
-
-    if (!validParse)
-      continue;
-
-    bool patched = false;
-
-    // Attempt 1: Raw Address
-    if (dbgFuncs->MemPatch(addr, &newB, 1)) {
-      Log("[PatchMgr] Line %d: Patched via Raw Address (%p)\n", lineNum,
-          (void *)addr);
-      patched = true;
-    }
-
-    // Attempt 2: RVA (ImageBase + Addr) - PRIORITY per User Request
-    // ("Default add ImageBase")
-    if (!patched && imageBase != 0) {
-      if (dbgFuncs->MemPatch(imageBase + addr, &newB, 1)) {
-        Log("[PatchMgr] Line %d: Patched via RVA (%p + %p -> %p)\n", lineNum,
-            (void *)imageBase, (void *)addr, (void *)(imageBase + addr));
-        patched = true;
-      }
-    }
-
-    // Attempt 3: File Offset -> VA (Fallback)
-    // Only used if RVA failed (e.g. address wasn't a valid RVA or memory
-    // not mapped there)
-    if (!patched && dbgFuncs->FileOffsetToVa && mainModName[0] != 0) {
-      duint va = dbgFuncs->FileOffsetToVa(mainModName, addr);
-      if (va != 0 && dbgFuncs->MemPatch(va, &newB, 1)) {
-        Log("[PatchMgr] Line %d: Patched via FileOffset (%p -> %p)\n", lineNum,
-            (void *)addr, (void *)va);
-        patched = true;
-      }
-    }
-
-    if (patched) {
-      successCount++;
-    } else {
-      duint vaAttempt = (dbgFuncs->FileOffsetToVa && mainModName[0])
-                            ? dbgFuncs->FileOffsetToVa(mainModName, addr)
-                            : 0;
-      Log("[PatchMgr] Line %d: FAILED %p. Tried Raw, RVA(%p), "
-          "OffsetToVa(%p)\n",
-          lineNum, (void *)addr, (void *)(imageBase + addr), (void *)vaAttempt);
-      failCount++;
-    }
-  }
-  fclose(fp);
-
-  GuiUpdateAllViews();
-
-  char msg[256];
-  sprintf(msg, "Import complete (ImageBase: %p).\nSuccess: %d\nFailed: %d",
-          (void *)imageBase, successCount, failCount);
-  MessageBoxA(hPatchWindow, msg, "Patch Import", MB_ICONINFORMATION);
-
-  return successCount > 0;
-}
-
-bool ExportPatches(const char *filepath) {
-  FILE *fp = fopen(filepath, "w");
-  if (!fp)
-    return false;
-  fprintf(fp, "# x32dbg Patch Export (Filtered)\n# Format: "
-              "Address:OldByte->NewByte\n\n");
-
-  // Use g_Patches which contains the currently visible/filtered patches
-  for (const auto &p : g_Patches) {
-    // Each PatchInfo is a contiguous block
-    for (size_t k = 0; k < p.oldBytes.size(); ++k) {
-      duint currentAddr = p.address + k;
-      unsigned char oldB = p.oldBytes[k];
-      unsigned char newB =
-          (k < p.newBytes.size()) ? p.newBytes[k] : 0; // Should match size
-      fprintf(fp, "%p:%02X->%02X\n", (void *)currentAddr, oldB, newB);
-    }
-  }
-
-  fclose(fp);
-  return true;
-}
-
-bool ExportTableToCSV(const char *filepath) {
-  FILE *fp = fopen(filepath, "w");
-  if (!fp)
-    return false;
-
-  // Write UTF-8 BOM
-  fputc(0xEF, fp);
-  fputc(0xBB, fp);
-  fputc(0xBF, fp);
-
-  fprintf(fp, "Address,Module,Old Bytes,New Bytes,Old Instruction,New "
-              "Instruction,Comment\n");
-
-  auto safeObj = [](const std::string &s) {
-    std::string out = "\"";
-    for (char c : s) {
-      if (c == '"')
-        out += "\"\"";
-      else
-        out += c;
-    }
-    out += "\"";
-    return out;
-  };
-
-  for (const auto &p : g_Patches) {
-    char addrBuf[32];
-    sprintf(addrBuf, "%p", (void *)p.address);
-
-    fprintf(
-        fp, "%s,%s,%s,%s,%s,%s,%s\n", addrBuf, safeObj(p.moduleName).c_str(),
-        safeObj(BytesToHex(p.oldBytes)).c_str(),
-        safeObj(BytesToHex(p.newBytes)).c_str(), safeObj(p.oldDisasm).c_str(),
-        safeObj(p.disasm).c_str(), safeObj(p.comment).c_str());
-  }
-
-  fclose(fp);
-  return true;
+  return result;
 }

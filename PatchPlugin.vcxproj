@@ -180,11 +180,13 @@
     <ClCompile Include="plugin.cpp" />
     <ClCompile Include="pluginmain.cpp" />
     <ClCompile Include="PatchWindow.cpp" />
+    <ClCompile Include="save.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="plugin.h" />
     <ClInclude Include="pluginmain.h" />
     <ClInclude Include="PatchWindow.h" />
+    <ClInclude Include="save.h" />
     <ClInclude Include="pluginsdk\bridgegraph.h" />
     <ClInclude Include="pluginsdk\bridgelist.h" />
     <ClInclude Include="pluginsdk\bridgemain.h" />
