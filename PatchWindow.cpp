@@ -1991,10 +1991,9 @@ bool GetFileNameFromUser(char *buffer, int maxLen, bool save,
     ofn.lpstrFilter = "PatchKing File (*.patchking)\0*.patchking\0x64dbg Patch "
                       "File (*.1337)\0*.1337\0All Files (*.*)\0*.*\0";
   } else {
-    ofn.lpstrFilter =
-        "Patch Files "
-        "(*.txt;*.patch;*.1337;*.patchking)\0*.txt;*.patch;*.1337;"
-        "*.patchking\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFilter = "Patch Files "
+                      "(*.1337;*.patchking)\0*.1337;"
+                      "*.patchking\0All Files (*.*)\0*.*\0";
   }
 
   ofn.lpstrFile = buffer;

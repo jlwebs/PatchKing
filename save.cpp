@@ -146,17 +146,21 @@ bool ImportAndApplyPatches(HWND hwnd, const char *filepath) {
       continue;
 
     // Determine Target Address
-    // If currentBase is set (via >Module or default Main), treat addr as RVA.
-    // If user didn't provide >Module, we used default Main.
-    // This matches user requirement "1337 uses relative address".
+    // Fix for PatchKing vs 1337 Import Logic:
+    // 1. If format has '->' (hasOld == true), it is 1337 format using RVA.
+    // 2. If format has NO '->' (hasOld == false), it is PatchKing format using
+    // Absolute Address.
 
     duint targetVA = 0;
 
-    // Priority: RVA
-    if (currentBase != 0) {
-      targetVA = currentBase + addr;
-    } else {
-      // Fallback to raw if no base found
+    if (hasOld) { // 1337 Format (RVA)
+      if (currentBase != 0) {
+        targetVA = currentBase + addr;
+      } else {
+        // Fallback to raw if no base found
+        targetVA = addr;
+      }
+    } else { // PatchKing Format (Absolute)
       targetVA = addr;
     }
 
