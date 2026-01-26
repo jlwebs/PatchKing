@@ -56,10 +56,24 @@ jobs:
           x64/Release/*.dp64
           x64/Release/*.pdb
 
-    - name: Release
+    - name: Release (Tagged)
       if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v1
       with:
+        files: |
+          Release/*.dp32
+          x64/Release/*.dp64
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Release (Continuous / Latest)
+      if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && !startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: latest
+        name: Latest Build
+        prerelease: true
+        overwrite: true
         files: |
           Release/*.dp32
           x64/Release/*.dp64
